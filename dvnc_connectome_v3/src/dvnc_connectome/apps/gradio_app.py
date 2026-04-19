@@ -1,22 +1,17 @@
 """
 DVNC.AI Gradio Application
 
-Three tabs:
-  1. Discovery Engine — full 6-agent pipeline with visible routing
-  2. Connectome Explorer — browse the knowledge graph interactively
-  3. Database Inspector — raw stats, node/synapse browser
-
-Visual routing panel shows:
-  - Primary route with relation types and scores
-  - Alternative routes
-  - Suppressed hub nodes
-  - LMM activations
-  - Spreading activation heatmap (text-based)
+Four tabs:
+  1. Discovery Engine  — full 6-agent pipeline with visible routing
+  2. Head-to-Head      — DVNC.AI vs plain LLM side-by-side comparison
+  3. Connectome Explorer — browse the knowledge graph interactively
+  4. Database Inspector  — raw stats, node/synapse browser
 """
 
 from __future__ import annotations
 import json
 import os
+import re
 from pathlib import Path
 
 import gradio as gr
@@ -39,7 +34,6 @@ def _format_route_panel(route_result) -> str:
     lines.append("╚══════════════════════════════════════════════════════╝")
     lines.append("")
 
-    # Primary route — normalise score bars to max 10 blocks
     lines.append("── PRIMARY ROUTE ──────────────────────────────────────")
     max_route_score = max((s.score for s in route_result.primary_route), default=1) or 1
     for i, step in enumerate(route_result.primary_route):
@@ -56,7 +50,6 @@ def _format_route_panel(route_result) -> str:
 
     lines.append("")
 
-    # Alternative routes
     if route_result.alternative_routes:
         lines.append("── ALTERNATIVE ROUTES ─────────────────────────────────")
         for i, alt in enumerate(route_result.alternative_routes, 1):
@@ -64,7 +57,6 @@ def _format_route_panel(route_result) -> str:
             lines.append(f"  Alt {i}: {alt_path}")
         lines.append("")
 
-    # Suppressed hubs
     if route_result.suppressed_hubs:
         lines.append("── SUPPRESSED HUBS (hub suppression active) ──────────")
         for hub in route_result.suppressed_hubs[:5]:
@@ -72,26 +64,21 @@ def _format_route_panel(route_result) -> str:
             lines.append(f"  ✕ {label}")
         lines.append("")
 
-    # LMM Activations — normalise bars to max 20 blocks
     lmm = route_result.lmm_activations
     if lmm:
         lines.append("── DA VINCI MENTAL MODEL ACTIVATIONS ─────────────────")
         sorted_lmm = sorted(lmm.items(), key=lambda x: x[1], reverse=True)
-        max_lmm = sorted_lmm[0][1] if sorted_lmm else 1
-        max_lmm = max_lmm or 1
         for code, score in sorted_lmm[:5]:
             name = LMM_LABELS.get(code, code)
-            norm = score / max_lmm
-            bar = "█" * max(1, int(norm * 20))
+            bar = "█" * max(1, int(score * 5))
             lines.append(f"  {code} {name:<28} {score:.2f} [{bar}]")
         lines.append("")
 
-    # Spreading activation top nodes
     lines.append("── SPREADING ACTIVATION MAP (top 15 nodes) ───────────")
-    max_score = max((s for _, s in route_result.activation_map[:15]), default=1) or 1
+    max_score = max((s for _, s in route_result.activation_map[:15]), default=1)
     for node_id, score in route_result.activation_map[:15]:
         label = node_id.split("::")[-1][:25]
-        norm = score / max_score
+        norm = score / max_score if max_score else 0
         bar = "█" * max(1, int(norm * 20))
         lines.append(f"  {label:<26} {score:.4f} [{bar}]")
 
@@ -113,6 +100,81 @@ def _format_agent_log(agent_log: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _call_plain_llm(brief: str) -> str:
+    """
+    Send the brief directly to the LLM with no knowledge graph, no routing,
+    no evidence pack. This is the 'vanilla LLM' baseline for Head-to-Head.
+    Uses whatever LLM backend is configured in agents/base.py via env vars.
+    """
+    system = (
+        "You are a research scientist and innovation consultant. "
+        "Given a design brief, produce a detailed innovation proposal. "
+        "Include: a cross-domain insight, a specific testable hypothesis, "
+        "a step-by-step experimental programme, and a commercial/IP lens. "
+        "Be as specific as possible. Cite any papers you can recall by name."
+    )
+    try:
+        # Reuse whichever LLM backend is active (Groq / Gemini / DeepSeek)
+        from ..agents.base import _call_claude
+        return _call_claude(system, brief, max_tokens=1200)
+    except Exception as e:
+        return f"[Plain LLM error: {e}]"
+
+
+def _score_output(text: str) -> dict:
+    """
+    Heuristic scoring of an output text on four dimensions (0–100 each).
+    Returns dict with keys: citations, specificity, structure, overall.
+    """
+    citations = len(re.findall(r'\[S\d+\]', text))
+    numbers   = len(re.findall(r'\d+\.?\d*\s*(?:kPa|MPa|GPa|S/cm|nm|μm|mm|cm|mg|mL|wt%|%|Hz|°C)', text))
+    steps     = len(re.findall(r'(?:Step\s*\d|IF\s|THEN\s|→)', text, re.IGNORECASE))
+    words     = len(text.split())
+
+    cit_score  = min(100, citations * 14)
+    spec_score = min(100, numbers   * 10 + steps * 6)
+    struct_score = min(100, steps * 12 + (20 if len(text) > 400 else 0))
+    concision  = 100 if 120 <= words <= 600 else max(0, 100 - abs(words - 360) // 4)
+
+    overall = int(
+        0.35 * cit_score +
+        0.30 * spec_score +
+        0.20 * struct_score +
+        0.15 * concision
+    )
+    return {
+        "citations":   cit_score,
+        "specificity": spec_score,
+        "structure":   struct_score,
+        "concision":   concision,
+        "overall":     overall,
+    }
+
+
+def _render_score_bars(dvnc_scores: dict, plain_scores: dict) -> str:
+    """Render a text-based score comparison table."""
+    dims = [
+        ("Citations",   "citations"),
+        ("Specificity", "specificity"),
+        ("Structure",   "structure"),
+        ("Concision",   "concision"),
+        ("OVERALL",     "overall"),
+    ]
+    lines = []
+    lines.append("╔══════════════════════════════════════════════════════════════╗")
+    lines.append("║  DIMENSION        DVNC.AI  ████████░░  Plain LLM            ║")
+    lines.append("╠══════════════════════════════════════════════════════════════╣")
+    for label, key in dims:
+        d = dvnc_scores[key]
+        p = plain_scores[key]
+        d_bar = "█" * (d // 10) + "░" * (10 - d // 10)
+        p_bar = "█" * (p // 10) + "░" * (10 - p // 10)
+        winner = " ◀ DVNC" if d > p else (" ◀ LLM" if p > d else " TIE")
+        lines.append(f"  {label:<14} {d:3d}  [{d_bar}]  {p:3d}  [{p_bar}]{winner}")
+    lines.append("╚══════════════════════════════════════════════════════════════╝")
+    return "\n".join(lines)
+
+
 # ── Main App Factory ───────────────────────────────────────────────────────
 
 
@@ -121,18 +183,19 @@ def make_app(db_path: str) -> gr.Blocks:
     router = DaVinciRouter(db)
     orchestrator = DVNCOrchestrator(db=db)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Tab 1: Discovery Engine
-    # ─────────────────────────────────────────────────────────────────────
     with gr.Blocks(
         title="DVNC.AI — Brain-Inspired Design Discovery",
         theme=gr.themes.Soft(primary_hue="violet"),
     ) as app:
+
         gr.HTML("""
-        <div style="text-align:center; padding:20px; background: linear-gradient(135deg, #1a0a2e, #16213e);
+        <div style="text-align:center; padding:20px;
+                    background: linear-gradient(135deg, #1a0a2e, #16213e);
                     border-radius:12px; margin-bottom:20px;">
             <h1 style="color:#c084fc; font-size:2.2em; margin:0;">🧠 DVNC.AI</h1>
-            <p style="color:#94a3b8; margin:8px 0 0;">Brain-Inspired Polymathic Design Discovery System</p>
+            <p style="color:#94a3b8; margin:8px 0 0;">
+                Brain-Inspired Polymathic Design Discovery System
+            </p>
             <p style="color:#64748b; font-size:0.85em;">
                 Da Vinci Routing · 6-Agent Debate · Hebbian Connectome · Visible Reasoning
             </p>
@@ -141,7 +204,9 @@ def make_app(db_path: str) -> gr.Blocks:
 
         with gr.Tabs():
 
-            # ── Tab 1: Discovery Engine ───────────────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # TAB 1 — Discovery Engine
+            # ══════════════════════════════════════════════════════════════
             with gr.TabItem("🔬 Discovery Engine"):
                 gr.Markdown("""
                 Enter a design challenge. The system routes through the DVNC Connectome,
@@ -162,8 +227,8 @@ def make_app(db_path: str) -> gr.Blocks:
                         )
                     with gr.Column(scale=1):
                         api_key_input = gr.Textbox(
-                            label="Anthropic API Key (optional — enables Claude Opus synthesis)",
-                            placeholder="sk-ant-...",
+                            label="API Key (optional — enables AI synthesis)",
+                            placeholder="Paste your Groq / Gemini / DeepSeek key",
                             type="password",
                         )
                         steps_slider = gr.Slider(2, 6, value=4, step=1, label="Routing Steps")
@@ -198,25 +263,34 @@ def make_app(db_path: str) -> gr.Blocks:
                     if not brief.strip():
                         return "No route", "Please enter a design brief.", "", 0, "Enter a brief first."
 
-                    # Inject API key if provided
                     if api_key.strip():
-                        os.environ["ANTHROPIC_API_KEY"] = api_key.strip()
+                        # Detect key type and set correct env var
+                        key = api_key.strip()
+                        if key.startswith("gsk_"):
+                            os.environ["GROQ_API_KEY"] = key
+                        elif key.startswith("AIza"):
+                            os.environ["GEMINI_API_KEY"] = key
+                        elif key.startswith("sk-ant"):
+                            os.environ["ANTHROPIC_API_KEY"] = key
+                        else:
+                            # DeepSeek or other OpenAI-compatible
+                            os.environ["DEEPSEEK_API_KEY"] = key
 
                     try:
-                        # Update router settings
                         router.steps = int(steps)
                         router.fanout = int(fanout)
 
-                        # Run Da Vinci routing
                         route_result = router.route(brief)
                         route_panel_text = _format_route_panel(route_result)
 
-                        # Run 6-agent pipeline
                         result = orchestrator.run(brief=brief, route_result=route_result)
 
                         log_text = _format_agent_log(result["agent_log"])
                         score = round(result["overall_score"] * 100)
-                        status = f"✓ Complete | Score: {score}/100 | Agents: 6 | Evidence sources: {len(route_result.evidence_nodes)}"
+                        status = (
+                            f"✓ Complete | Score: {score}/100 | "
+                            f"Agents: 6 | Evidence sources: {len(route_result.evidence_nodes)}"
+                        )
 
                         return (
                             route_panel_text,
@@ -234,7 +308,225 @@ def make_app(db_path: str) -> gr.Blocks:
                     outputs=[route_panel, final_card, agent_log_out, overall_score_out, status_out],
                 )
 
-            # ── Tab 2: Connectome Explorer ────────────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # TAB 2 — Head-to-Head Comparison
+            # ══════════════════════════════════════════════════════════════
+            with gr.TabItem("⚔️ Head-to-Head"):
+
+                gr.HTML("""
+                <div style="padding:14px 0 4px;">
+                    <h3 style="margin:0 0 6px;font-size:1.1em;">DVNC.AI vs Plain LLM</h3>
+                    <p style="color:#64748b;font-size:0.9em;margin:0;">
+                        Same brief. Same model. One goes through the Da Vinci Connectome
+                        with 6 specialised agents and a knowledge graph.
+                        The other goes directly to the LLM with no routing, no evidence pack.
+                        See the difference provenance makes.
+                    </p>
+                </div>
+                """)
+
+                with gr.Row():
+                    h2h_brief = gr.Textbox(
+                        label="Design Brief",
+                        placeholder=(
+                            "e.g. Design a novel composite biomaterial for myocardial infarction "
+                            "combining auxetic mechanics, electrical conductivity, and immunomodulation"
+                        ),
+                        lines=3,
+                    )
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        h2h_api_key = gr.Textbox(
+                            label="API Key",
+                            placeholder="Paste your Groq / Gemini / DeepSeek key",
+                            type="password",
+                        )
+                    with gr.Column(scale=1):
+                        h2h_steps = gr.Slider(2, 6, value=4, step=1, label="DVNC Routing Steps")
+                    with gr.Column(scale=1):
+                        h2h_fanout = gr.Slider(5, 40, value=20, step=5, label="DVNC Fanout")
+                    with gr.Column(scale=1):
+                        h2h_run_btn = gr.Button(
+                            "⚔️ Run Head-to-Head", variant="primary", size="lg"
+                        )
+
+                h2h_status = gr.Textbox(label="Status", lines=1, interactive=False)
+
+                # ── Score comparison bar ──────────────────────────────────
+                h2h_scores = gr.Textbox(
+                    label="Score Comparison (Citations · Specificity · Structure · Concision · Overall)",
+                    lines=10,
+                    interactive=False,
+                )
+
+                # ── Side-by-side outputs ──────────────────────────────────
+                gr.HTML("<hr style='margin:18px 0;border-color:#e2e8f0'>")
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.HTML("""
+                        <div style="background:#1a0a2e;border-radius:8px 8px 0 0;
+                                    padding:10px 16px;display:flex;align-items:center;
+                                    justify-content:space-between;">
+                            <div>
+                                <span style="color:#c084fc;font-weight:600;font-size:1em;">
+                                    🧠 DVNC.AI
+                                </span>
+                                <span style="color:#64748b;font-size:0.78em;margin-left:10px;">
+                                    Da Vinci Routing · 6-Agent Debate · Connectome-grounded
+                                </span>
+                            </div>
+                        </div>
+                        """)
+                        dvnc_out = gr.Textbox(
+                            label="",
+                            lines=30,
+                            max_lines=50,
+                            interactive=False,
+                            show_label=False,
+                        )
+                        dvnc_score_display = gr.Number(
+                            label="DVNC.AI Overall Score (0–100)"
+                        )
+
+                    with gr.Column(scale=1):
+                        gr.HTML("""
+                        <div style="background:#f1f5f9;border-radius:8px 8px 0 0;
+                                    padding:10px 16px;display:flex;align-items:center;
+                                    justify-content:space-between;">
+                            <div>
+                                <span style="color:#334155;font-weight:600;font-size:1em;">
+                                    🤖 Plain LLM
+                                </span>
+                                <span style="color:#94a3b8;font-size:0.78em;margin-left:10px;">
+                                    Same model · No knowledge graph · No citations · No routing
+                                </span>
+                            </div>
+                        </div>
+                        """)
+                        plain_out = gr.Textbox(
+                            label="",
+                            lines=30,
+                            max_lines=50,
+                            interactive=False,
+                            show_label=False,
+                        )
+                        plain_score_display = gr.Number(
+                            label="Plain LLM Overall Score (0–100)"
+                        )
+
+                # ── Route trace (collapsed) ───────────────────────────────
+                with gr.Accordion("DVNC.AI Routing Trace", open=False):
+                    h2h_route = gr.Textbox(
+                        label="Da Vinci Routing Panel",
+                        lines=20,
+                        interactive=False,
+                    )
+
+                with gr.Accordion("DVNC.AI Agent Debate Log", open=False):
+                    h2h_agent_log = gr.Textbox(
+                        label="6-Agent Pipeline Log",
+                        lines=30,
+                        interactive=False,
+                    )
+
+                # ── Handler ───────────────────────────────────────────────
+                def run_h2h(brief, api_key, steps, fanout):
+                    if not brief.strip():
+                        return (
+                            "Please enter a design brief.",
+                            "", "", 0, 0,
+                            "No route", "",
+                        )
+
+                    if api_key.strip():
+                        key = api_key.strip()
+                        if key.startswith("gsk_"):
+                            os.environ["GROQ_API_KEY"] = key
+                        elif key.startswith("AIza"):
+                            os.environ["GEMINI_API_KEY"] = key
+                        elif key.startswith("sk-ant"):
+                            os.environ["ANTHROPIC_API_KEY"] = key
+                        else:
+                            os.environ["DEEPSEEK_API_KEY"] = key
+
+                    # ── Step 1: DVNC.AI ──────────────────────────────────
+                    try:
+                        router.steps = int(steps)
+                        router.fanout = int(fanout)
+
+                        route_result = router.route(brief)
+                        route_text = _format_route_panel(route_result)
+
+                        dvnc_result = orchestrator.run(
+                            brief=brief, route_result=route_result
+                        )
+                        dvnc_card = dvnc_result["final_card"]
+                        dvnc_log  = _format_agent_log(dvnc_result["agent_log"])
+                        dvnc_pipeline_score = round(dvnc_result["overall_score"] * 100)
+
+                    except Exception as e:
+                        dvnc_card = f"[DVNC error: {e}]"
+                        dvnc_log  = ""
+                        route_text = f"Error: {e}"
+                        dvnc_pipeline_score = 0
+                        route_result = None
+
+                    # ── Step 2: Plain LLM ────────────────────────────────
+                    try:
+                        plain_card = _call_plain_llm(brief)
+                    except Exception as e:
+                        plain_card = f"[Plain LLM error: {e}]"
+
+                    # ── Step 3: Score both ───────────────────────────────
+                    dvnc_scores  = _score_output(dvnc_card)
+                    plain_scores = _score_output(plain_card)
+
+                    # Blend pipeline score with heuristic score for DVNC
+                    dvnc_scores["overall"] = max(
+                        dvnc_scores["overall"],
+                        dvnc_pipeline_score,
+                    )
+
+                    score_bars = _render_score_bars(dvnc_scores, plain_scores)
+
+                    sources = len(route_result.evidence_nodes) if route_result else 0
+                    status = (
+                        f"✓ Complete | DVNC: {dvnc_scores['overall']}/100 | "
+                        f"Plain LLM: {plain_scores['overall']}/100 | "
+                        f"Evidence sources: {sources}"
+                    )
+
+                    return (
+                        status,
+                        score_bars,
+                        dvnc_card,
+                        plain_card,
+                        dvnc_scores["overall"],
+                        plain_scores["overall"],
+                        route_text,
+                        dvnc_log,
+                    )
+
+                h2h_run_btn.click(
+                    fn=run_h2h,
+                    inputs=[h2h_brief, h2h_api_key, h2h_steps, h2h_fanout],
+                    outputs=[
+                        h2h_status,
+                        h2h_scores,
+                        dvnc_out,
+                        plain_out,
+                        dvnc_score_display,
+                        plain_score_display,
+                        h2h_route,
+                        h2h_agent_log,
+                    ],
+                )
+
+            # ══════════════════════════════════════════════════════════════
+            # TAB 3 — Connectome Explorer
+            # ══════════════════════════════════════════════════════════════
             with gr.TabItem("🕸 Connectome Explorer"):
                 gr.Markdown("""
                 Browse the knowledge graph directly. Explore concepts, see their neighbours,
@@ -245,39 +537,31 @@ def make_app(db_path: str) -> gr.Blocks:
                     concept_input = gr.Textbox(
                         label="Concept to explore",
                         value="bone",
-                        placeholder="e.g. carbon, muscle, topology, flow ...",
+                        placeholder="e.g. auxetic, raman, scaffold, cardiomyocyte",
                     )
-                    limit_slider = gr.Slider(5, 60, value=20, step=5, label="Neighbour limit")
-                    explore_btn = gr.Button("Explore", variant="primary")
+                    limit_slider = gr.Slider(5, 50, value=20, step=5, label="Max neighbours")
+                    explore_btn = gr.Button("Explore", variant="secondary")
+
+                neighbours_out = gr.Dataframe(
+                    headers=["From", "To", "Relation", "Weight", "Evidence Count"],
+                    label="Top Neighbours",
+                    interactive=False,
+                )
 
                 with gr.Row():
-                    neighbours_out = gr.Dataframe(
-                        label="Strongest Synapses (neighbours)",
-                        headers=["From", "To", "Relation", "Weight", "Evidence Count"],
-                        interactive=False,
-                    )
-
-                gr.Markdown("### Spreading Activation")
-                with gr.Row():
-                    prop_steps = gr.Slider(1, 6, value=3, step=1, label="Propagation steps")
-                    prop_fanout = gr.Slider(5, 40, value=15, step=5, label="Fanout")
-                    prop_btn = gr.Button("Propagate", variant="secondary")
+                    prop_steps = gr.Slider(1, 6, value=3, step=1, label="Propagation Steps")
+                    prop_fanout = gr.Slider(5, 30, value=15, step=5, label="Fanout")
+                    prop_btn = gr.Button("Propagate Activation", variant="secondary")
 
                 propagation_out = gr.Dataframe(
-                    label="Activation scores (top activated nodes)",
-                    headers=["Node", "Label", "Score"],
+                    headers=["Node ID", "Label", "Activation Score"],
+                    label="Spreading Activation Result",
                     interactive=False,
                 )
 
                 def explore_concept(concept, limit):
                     node_id = f"concept::{concept.strip().lower()}"
                     neighbors = db.top_neighbors(node_id, limit=int(limit))
-                    if not neighbors:
-                        # Try fuzzy search
-                        matches = db.search_nodes(concept, kind="Concept", limit=5)
-                        if matches:
-                            node_id = f"concept::{matches[0]['label']}"
-                            neighbors = db.top_neighbors(node_id, limit=int(limit))
                     rows = [
                         [
                             n["pre"].split("::")[-1],
@@ -310,50 +594,68 @@ def make_app(db_path: str) -> gr.Blocks:
                     outputs=[propagation_out],
                 )
 
-            # ── Tab 3: Database Inspector ─────────────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # TAB 4 — Database Inspector
+            # ══════════════════════════════════════════════════════════════
             with gr.TabItem("📊 Database Inspector"):
                 gr.Markdown("### Connectome Statistics")
 
                 stats_btn = gr.Button("Refresh Stats", variant="secondary")
-                stats_out = gr.JSON(label="Database Statistics")
-
-                gr.Markdown("### Node Browser")
-                with gr.Row():
-                    node_kind = gr.Dropdown(
-                        choices=["Concept", "Document", "Domain"],
-                        value="Concept",
-                        label="Node kind",
-                    )
-                    node_search = gr.Textbox(label="Search nodes (label contains)", placeholder="flow")
-                    node_search_btn = gr.Button("Search", variant="secondary")
-
-                nodes_out = gr.Dataframe(
-                    label="Nodes",
-                    headers=["ID", "Kind", "Label", "Domain"],
+                stats_out = gr.Textbox(
+                    label="Database Statistics",
+                    lines=20,
                     interactive=False,
                 )
 
-                gr.Markdown("### Top Synapses by Weight")
-                top_syn_btn = gr.Button("Show Top Synapses", variant="secondary")
+                with gr.Row():
+                    node_kind = gr.Dropdown(
+                        choices=["all", "concept", "document", "domain"],
+                        value="all",
+                        label="Node Kind",
+                    )
+                    node_search = gr.Textbox(
+                        label="Search nodes (label contains)",
+                        placeholder="e.g. cardiac",
+                    )
+                    node_search_btn = gr.Button("Search Nodes", variant="secondary")
+
+                nodes_out = gr.Dataframe(
+                    headers=["ID", "Kind", "Label", "Domain"],
+                    label="Nodes",
+                    interactive=False,
+                )
+
+                top_syn_btn = gr.Button("Show Top 50 Synapses", variant="secondary")
                 syn_out = gr.Dataframe(
-                    label="Top 50 synapses by weight",
                     headers=["From", "To", "Relation", "Weight", "Evidence", "LMM Tags"],
+                    label="Top Synapses by Weight",
                     interactive=False,
                 )
 
                 def get_stats():
-                    return db.stats()
+                    stats = db.get_stats()
+                    lines = [
+                        "╔══════════════════════════════════════════════╗",
+                        "║         DVNC CONNECTOME — DB STATS          ║",
+                        "╚══════════════════════════════════════════════╝",
+                        "",
+                    ]
+                    for k, v in stats.items():
+                        lines.append(f"  {k:<30} {v}")
+                    return "\n".join(lines)
 
-                def search_nodes(kind, query):
-                    nodes = db.search_nodes(query, kind=kind, limit=50)
+                def search_nodes(kind, search_term):
+                    nodes = db.search_nodes(
+                        kind=None if kind == "all" else kind,
+                        label_contains=search_term or None,
+                        limit=100,
+                    )
                     rows = []
                     for n in nodes:
-                        props = n.get("props", {})
-                        if isinstance(props, str):
-                            try:
-                                props = json.loads(props)
-                            except Exception:
-                                props = {}
+                        try:
+                            props = json.loads(n.get("props", "{}"))
+                        except Exception:
+                            props = {}
                         rows.append([
                             n["id"],
                             n["kind"],
@@ -378,22 +680,27 @@ def make_app(db_path: str) -> gr.Blocks:
                     return rows
 
                 stats_btn.click(fn=get_stats, outputs=[stats_out])
-                node_search_btn.click(fn=search_nodes, inputs=[node_kind, node_search], outputs=[nodes_out])
+                node_search_btn.click(
+                    fn=search_nodes,
+                    inputs=[node_kind, node_search],
+                    outputs=[nodes_out],
+                )
                 top_syn_btn.click(fn=get_top_synapses, outputs=[syn_out])
 
-                # Auto-load stats on startup
                 app.load(fn=get_stats, outputs=[stats_out])
 
-            # ── Tab 4: Add Papers ──────────────────────────────────────────
+            # ══════════════════════════════════════════════════════════════
+            # TAB 5 — Add Papers
+            # ══════════════════════════════════════════════════════════════
             with gr.TabItem("📄 Add Papers"):
                 gr.Markdown("""
                 ### Add Papers to the Connectome
-                
+
                 Add new papers to enrich the knowledge graph. Three methods:
                 1. **Fetch by DOI** — enter a DOI and we pull title + abstract from Semantic Scholar
                 2. **Search** — search for papers by topic and add the best matches
                 3. **Paste directly** — paste the title, abstract, and key details of a paper
-                
+
                 New papers are immediately ingested into the live connectome.
                 """)
 
@@ -401,115 +708,80 @@ def make_app(db_path: str) -> gr.Blocks:
                 with gr.Row():
                     doi_input = gr.Textbox(
                         label="DOI",
-                        placeholder="e.g. 10.1002/adfm.201800618",
+                        placeholder="e.g. 10.1126/sciadv.1601007",
                     )
-                    doi_domain = gr.Dropdown(
-                        choices=["cardiac_biomaterials", "raman_spectroscopy",
-                                 "conducting_polymers", "biomineralization",
-                                 "biomechanics", "materials", "general"],
-                        value="general",
-                        label="Domain",
-                    )
-                    doi_fetch_btn = gr.Button("Fetch & Ingest", variant="primary")
-                doi_status = gr.Textbox(label="Status", interactive=False)
+                    doi_btn = gr.Button("Fetch & Ingest", variant="secondary")
+                doi_out = gr.Textbox(label="Result", lines=4, interactive=False)
 
-                gr.Markdown("### Method 2: Search for Papers")
+                gr.Markdown("### Method 2: Search by Topic")
                 with gr.Row():
-                    search_input = gr.Textbox(
+                    search_query_input = gr.Textbox(
                         label="Search Query",
-                        placeholder="e.g. auxetic cardiac patch conductive polymer",
+                        placeholder="e.g. auxetic cardiac patch biomaterial",
                     )
-                    search_max = gr.Slider(1, 20, value=5, step=1, label="Max results")
-                    search_btn = gr.Button("Search & Ingest", variant="primary")
-                search_status = gr.Textbox(label="Status", interactive=False)
+                    search_papers_btn = gr.Button("Search & Ingest Top 3", variant="secondary")
+                search_out = gr.Textbox(label="Result", lines=6, interactive=False)
 
-                gr.Markdown("### Method 3: Paste Paper Directly")
+                gr.Markdown("### Method 3: Paste Directly")
                 with gr.Row():
                     with gr.Column():
-                        paste_title = gr.Textbox(label="Paper Title")
-                        paste_authors = gr.Textbox(label="Authors")
-                        paste_year = gr.Number(label="Year", value=2024)
-                        paste_domain_sel = gr.Dropdown(
-                            choices=["cardiac_biomaterials", "raman_spectroscopy",
-                                     "conducting_polymers", "biomineralization",
-                                     "biomechanics", "materials", "general"],
-                            value="general",
-                            label="Domain",
-                        )
-                    with gr.Column():
-                        paste_text = gr.Textbox(
-                            label="Abstract + Key Findings (paste full text here)",
-                            lines=12,
-                            placeholder="Paste the abstract, key findings, measurements, and methods...",
-                        )
-                        paste_url = gr.Textbox(label="URL / DOI (optional)")
-                paste_btn = gr.Button("Save & Ingest", variant="primary")
-                paste_status = gr.Textbox(label="Status", interactive=False)
+                        paste_title  = gr.Textbox(label="Title", lines=1)
+                        paste_text   = gr.Textbox(label="Abstract / Key Text", lines=5)
+                        paste_source = gr.Textbox(label="Source / Author", value="manual")
+                        paste_domain = gr.Textbox(label="Domain", value="general")
+                        paste_btn    = gr.Button("Ingest Paper", variant="secondary")
+                paste_out = gr.Textbox(label="Result", lines=3, interactive=False)
 
-                def fetch_doi(doi_val, domain_val):
-                    if not doi_val.strip():
-                        return "Please enter a DOI."
+                def fetch_doi(doi):
                     try:
-                        from ..curation.stevens_loader import fetch_paper_by_doi
                         from ..curation.pipeline import ingest_docs
-                        paper = fetch_paper_by_doi(doi_val.strip())
-                        if not paper:
-                            return f"Could not fetch paper for DOI: {doi_val}"
-                        paper["domain"] = domain_val
-                        ingest_docs(db, [paper], verbose=False)
-                        return f"✓ Ingested: {paper['title']} ({len(paper['text'])} chars, domain: {domain_val})"
+                        from ..curation.fetchers import fetch_by_doi
+                        docs = fetch_by_doi(doi)
+                        if not docs:
+                            return f"No data found for DOI: {doi}"
+                        ingest_docs(db, docs, verbose=False)
+                        return f"✓ Ingested {len(docs)} document(s) for DOI {doi}"
                     except Exception as e:
                         return f"Error: {e}"
 
-                def search_and_ingest(query, max_results):
-                    if not query.strip():
-                        return "Please enter a search query."
+                def search_papers(query):
                     try:
-                        from ..curation.stevens_loader import search_papers
                         from ..curation.pipeline import ingest_docs
-                        papers = search_papers(query.strip(), max_results=int(max_results))
-                        if not papers:
-                            return f"No papers found for: {query}"
-                        ingest_docs(db, papers, verbose=False)
-                        titles = [p['title'][:60] for p in papers]
-                        return f"✓ Ingested {len(papers)} papers:\n" + "\n".join(f"  • {t}" for t in titles)
+                        from ..curation.fetchers import fetch_openalex
+                        docs = fetch_openalex(query, max_results=3)
+                        if not docs:
+                            return f"No results for: {query}"
+                        ingest_docs(db, docs, verbose=False)
+                        titles = "\n".join(f"  • {d.get('title','?')}" for d in docs)
+                        return f"✓ Ingested {len(docs)} paper(s):\n{titles}"
                     except Exception as e:
                         return f"Error: {e}"
 
-                def paste_and_ingest(title, authors, year, domain, text, url):
-                    if not title.strip() or not text.strip():
-                        return "Please enter at least a title and text."
+                def paste_paper(title, text, source, domain):
                     try:
-                        from ..curation.stevens_loader import save_uploaded_paper
                         from ..curation.pipeline import ingest_docs
-                        doc = save_uploaded_paper(
-                            title=title.strip(),
-                            text=text.strip(),
-                            domain=domain,
-                            authors=authors.strip(),
-                            year=int(year) if year else None,
-                            url=url.strip(),
-                        )
+                        if not title.strip() or not text.strip():
+                            return "Title and text are required."
+                        doc = {
+                            "doc_id": f"manual_{hash(title) % 99999:05d}",
+                            "title":  title.strip(),
+                            "text":   text.strip(),
+                            "source": source.strip() or "manual",
+                            "domain": domain.strip() or "general",
+                        }
                         ingest_docs(db, [doc], verbose=False)
-                        return f"✓ Saved and ingested: {title} ({len(text)} chars, domain: {domain})"
+                        return f"✓ Ingested: {title}"
                     except Exception as e:
                         return f"Error: {e}"
 
-                doi_fetch_btn.click(
-                    fn=fetch_doi,
-                    inputs=[doi_input, doi_domain],
-                    outputs=[doi_status],
-                )
-                search_btn.click(
-                    fn=search_and_ingest,
-                    inputs=[search_input, search_max],
-                    outputs=[search_status],
+                doi_btn.click(fn=fetch_doi, inputs=[doi_input], outputs=[doi_out])
+                search_papers_btn.click(
+                    fn=search_papers, inputs=[search_query_input], outputs=[search_out]
                 )
                 paste_btn.click(
-                    fn=paste_and_ingest,
-                    inputs=[paste_title, paste_authors, paste_year,
-                            paste_domain_sel, paste_text, paste_url],
-                    outputs=[paste_status],
+                    fn=paste_paper,
+                    inputs=[paste_title, paste_text, paste_source, paste_domain],
+                    outputs=[paste_out],
                 )
 
     return app
