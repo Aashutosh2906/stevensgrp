@@ -3,7 +3,7 @@ DVNC.AI Gradio Application
 
 Tabs:
   1. Discovery Engine     — full 6-agent pipeline with visible routing
-  2. Head-to-Head         — auto-uses last Discovery Engine result vs plain LLM
+  2. Head-to-Head         — auto-populated when Discovery Engine runs
   3. Connectome Explorer  — browse the knowledge graph interactively
   4. Database Inspector   — raw stats, node/synapse browser
   5. Add Papers           — ingest new papers into the connectome
@@ -116,7 +116,7 @@ def _set_api_key(key: str):
 
 
 def _call_plain_llm(brief: str) -> str:
-    """Send brief directly to the LLM — no routing, no evidence pack, no agents."""
+    """Send brief directly to the LLM — no routing, no evidence, no agents."""
     system = (
         "You are a research scientist and innovation consultant. "
         "Given a design brief, produce a detailed innovation proposal. "
@@ -157,6 +157,28 @@ def _score_output(text: str) -> dict:
         "concision":   concision,
         "overall":     overall,
     }
+
+
+def _build_score_table(dvnc_scores: dict, plain_scores: dict) -> str:
+    dims = [
+        ("Citations",   "citations"),
+        ("Specificity", "specificity"),
+        ("Structure",   "structure"),
+        ("Concision",   "concision"),
+        ("OVERALL",     "overall"),
+    ]
+    lines = [
+        f"{'DIMENSION':<14}  {'DVNC.AI':^16}  {'Plain LLM':^16}  WINNER",
+        "─" * 62,
+    ]
+    for label, key in dims:
+        d = dvnc_scores[key]
+        p = plain_scores[key]
+        d_bar = "█" * (d // 10) + "░" * (10 - d // 10)
+        p_bar = "█" * (p // 10) + "░" * (10 - p // 10)
+        winner = "<-- DVNC" if d > p else ("<-- LLM " if p > d else "  TIE  ")
+        lines.append(f"{label:<14}  {d:3d} [{d_bar}]  {p:3d} [{p_bar}]  {winner}")
+    return "\n".join(lines)
 
 
 def _db_stats(db_path: str) -> str:
@@ -243,12 +265,6 @@ def make_app(db_path: str) -> gr.Blocks:
         theme=gr.themes.Soft(primary_hue="violet"),
     ) as app:
 
-        # ── Shared state across tabs ──────────────────────────────────────
-        # Stores the last Discovery Engine run so Head-to-Head can use it
-        last_brief       = gr.State("")
-        last_dvnc_card   = gr.State("")
-        last_dvnc_score  = gr.State(0)
-
         gr.HTML("""
         <div style="text-align:center; padding:20px;
                     background: linear-gradient(135deg, #1a0a2e, #16213e);
@@ -273,6 +289,7 @@ def make_app(db_path: str) -> gr.Blocks:
                 Enter a design challenge. The system routes through the DVNC Connectome,
                 runs 6 specialised AI agents in debate, and produces an evidence-anchored
                 Innovation Card with full provenance.
+                *After running, switch to the Head-to-Head tab to see the comparison — it will already be populated.*
                 """)
 
                 with gr.Row():
@@ -317,51 +334,9 @@ def make_app(db_path: str) -> gr.Blocks:
                 overall_score_out = gr.Number(label="Overall Innovation Score (0-100)")
                 status_out = gr.Textbox(label="Status", lines=2, interactive=False)
 
-                def run_discovery(brief, api_key, steps, fanout):
-                    if not brief.strip():
-                        return (
-                            "No route", "Please enter a design brief.",
-                            "", 0, "Enter a brief first.",
-                            "", "", 0,   # state outputs: brief, card, score
-                        )
-                    if api_key.strip():
-                        _set_api_key(api_key)
-                    try:
-                        router.steps  = int(steps)
-                        router.fanout = int(fanout)
-                        route_result     = router.route(brief)
-                        route_panel_text = _format_route_panel(route_result)
-                        result           = orchestrator.run(brief=brief, route_result=route_result)
-                        log_text         = _format_agent_log(result["agent_log"])
-                        score            = round(result["overall_score"] * 100)
-                        card             = result["final_card"]
-                        status = (
-                            f"Complete | Score: {score}/100 | "
-                            f"Agents: 6 | Evidence sources: {len(route_result.evidence_nodes)} "
-                            f"| Result saved — go to Head-to-Head tab to compare"
-                        )
-                        return (
-                            route_panel_text, card, log_text, score, status,
-                            brief, card, score,   # update shared state
-                        )
-                    except Exception as e:
-                        return (
-                            f"Error: {e}", "", "", 0, f"Error: {e}",
-                            "", "", 0,
-                        )
-
-                run_btn.click(
-                    fn=run_discovery,
-                    inputs=[brief_input, api_key_input, steps_slider, fanout_slider],
-                    outputs=[
-                        route_panel, final_card, agent_log_out,
-                        overall_score_out, status_out,
-                        last_brief, last_dvnc_card, last_dvnc_score,  # shared state
-                    ],
-                )
-
             # ══════════════════════════════════════════════════════════════
             # TAB 2 — Head-to-Head
+            # (components defined here so Discovery Engine can write to them)
             # ══════════════════════════════════════════════════════════════
             with gr.TabItem("Head-to-Head"):
 
@@ -369,32 +344,23 @@ def make_app(db_path: str) -> gr.Blocks:
                 <div style="padding:10px 0 16px;">
                     <h3 style="margin:0 0 6px;">DVNC.AI vs Plain LLM</h3>
                     <p style="color:#64748b; margin:0; font-size:0.9em;">
-                        This tab automatically uses the last query you ran in the
-                        <strong>Discovery Engine</strong> tab. Run a query there first,
-                        then come here and click <strong>Compare with Plain LLM</strong>.
-                        The same brief goes directly to the LLM — no routing, no knowledge
-                        graph, no 6-agent pipeline — so you can see exactly what the
-                        connectome adds.
+                        This tab is automatically populated when you run a query in the
+                        <strong>Discovery Engine</strong> tab. The same brief is sent
+                        directly to the LLM with no knowledge graph, no routing, and
+                        no 6-agent pipeline — so you can see exactly what the connectome adds.
                     </p>
                 </div>
                 """)
 
-                # Read-only display of what brief will be used
+                # Brief being compared — read only, auto-filled
                 h2h_brief_display = gr.Textbox(
-                    label="Brief being compared (from Discovery Engine)",
+                    label="Brief being compared",
                     lines=2,
                     interactive=False,
-                    placeholder="Run a query in the Discovery Engine tab first...",
+                    placeholder="Run a query in the Discovery Engine tab — results will appear here automatically.",
                 )
 
-                h2h_run_btn = gr.Button(
-                    "Compare with Plain LLM",
-                    variant="primary",
-                    size="lg",
-                )
-                h2h_status = gr.Textbox(label="Status", lines=1, interactive=False)
-
-                # Score comparison
+                # Score table
                 h2h_scores = gr.Textbox(
                     label="Score Comparison  (Citations / Specificity / Structure / Concision / Overall)",
                     lines=9, interactive=False,
@@ -407,7 +373,7 @@ def make_app(db_path: str) -> gr.Blocks:
                     with gr.Column(scale=1):
                         gr.Markdown("### DVNC.AI\n*Da Vinci Routing · 6-Agent Debate · Evidence-grounded*")
                         dvnc_out           = gr.Textbox(
-                            lines=28, max_lines=50,
+                            lines=30, max_lines=60,
                             interactive=False, show_label=False,
                         )
                         dvnc_score_display = gr.Number(label="DVNC.AI Score (0-100)")
@@ -415,105 +381,10 @@ def make_app(db_path: str) -> gr.Blocks:
                     with gr.Column(scale=1):
                         gr.Markdown("### Plain LLM\n*Same model · No graph · No citations · No routing*")
                         plain_out           = gr.Textbox(
-                            lines=28, max_lines=50,
+                            lines=30, max_lines=60,
                             interactive=False, show_label=False,
                         )
                         plain_score_display = gr.Number(label="Plain LLM Score (0-100)")
-
-                with gr.Accordion("DVNC.AI Routing Trace", open=False):
-                    h2h_route_display = gr.Textbox(
-                        label="Routing panel from Discovery Engine run",
-                        lines=5, interactive=False,
-                        placeholder="Will populate after you run Head-to-Head comparison.",
-                    )
-
-                # ── Load brief display when tab state updates ─────────────
-                def load_h2h_display(brief, dvnc_card):
-                    if not brief:
-                        return "Run a query in the Discovery Engine tab first..."
-                    return brief
-
-                last_brief.change(
-                    fn=load_h2h_display,
-                    inputs=[last_brief, last_dvnc_card],
-                    outputs=[h2h_brief_display],
-                )
-
-                # ── Run comparison ────────────────────────────────────────
-                def run_h2h(brief, dvnc_card, dvnc_pipeline_score):
-                    if not brief or not dvnc_card:
-                        return (
-                            "No Discovery Engine result found. Run a query in the Discovery Engine tab first.",
-                            "", "", "", 0, 0, "",
-                        )
-
-                    # Plain LLM — same brief, no graph
-                    try:
-                        plain_card = _call_plain_llm(brief)
-                    except Exception as e:
-                        plain_card = f"[Plain LLM error: {e}]"
-
-                    # Score both
-                    dvnc_scores  = _score_output(dvnc_card)
-                    plain_scores = _score_output(plain_card)
-                    dvnc_scores["overall"] = max(dvnc_scores["overall"], int(dvnc_pipeline_score))
-
-                    dims = [
-                        ("Citations",   "citations"),
-                        ("Specificity", "specificity"),
-                        ("Structure",   "structure"),
-                        ("Concision",   "concision"),
-                        ("OVERALL",     "overall"),
-                    ]
-                    score_lines = [
-                        f"{'DIMENSION':<14}  {'DVNC.AI':^16}  {'Plain LLM':^16}  WINNER",
-                        "─" * 62,
-                    ]
-                    for label, key in dims:
-                        d = dvnc_scores[key]
-                        p = plain_scores[key]
-                        d_bar = "█" * (d // 10) + "░" * (10 - d // 10)
-                        p_bar = "█" * (p // 10) + "░" * (10 - p // 10)
-                        winner = "<-- DVNC" if d > p else ("<-- LLM " if p > d else "  TIE  ")
-                        score_lines.append(
-                            f"{label:<14}  {d:3d} [{d_bar}]  {p:3d} [{p_bar}]  {winner}"
-                        )
-
-                    status = (
-                        f"Complete | DVNC.AI: {dvnc_scores['overall']}/100 | "
-                        f"Plain LLM: {plain_scores['overall']}/100"
-                    )
-
-                    route_note = (
-                        "The DVNC.AI output on the left was generated using the full "
-                        "Da Vinci routing + 6-agent pipeline from your Discovery Engine run.\n"
-                        "The Plain LLM output on the right used the same model with the same "
-                        "brief but with no knowledge graph, no routing, and no evidence pack."
-                    )
-
-                    return (
-                        status,
-                        "\n".join(score_lines),
-                        dvnc_card,
-                        plain_card,
-                        dvnc_scores["overall"],
-                        plain_scores["overall"],
-                        route_note,
-                    )
-
-                h2h_run_btn.click(
-                    fn=run_h2h,
-                    inputs=[last_brief, last_dvnc_card, last_dvnc_score],
-                    outputs=[
-                        h2h_status,
-                        h2h_scores,
-                        dvnc_out,
-                        plain_out,
-                        dvnc_score_display,
-                        plain_score_display,
-                        h2h_route_display,
-                    ],
-                )
 
             # ══════════════════════════════════════════════════════════════
             # TAB 3 — Connectome Explorer
@@ -744,5 +615,102 @@ def make_app(db_path: str) -> gr.Blocks:
                     inputs=[paste_title, paste_text, paste_source, paste_domain],
                     outputs=[paste_out],
                 )
+
+        # ── Discovery Engine click handler ────────────────────────────────
+        # Defined AFTER all tabs so it can write to H2H components directly.
+        # This is the key: run_discovery returns outputs for BOTH tabs at once.
+
+        def run_discovery(brief, api_key, steps, fanout):
+            empty = ("", "", 0, 0)  # h2h fallback
+
+            if not brief.strip():
+                return (
+                    "No route",
+                    "Please enter a design brief.",
+                    "",
+                    0,
+                    "Enter a brief first.",
+                    # H2H outputs
+                    "",
+                    "",
+                    "",
+                    0,
+                    0,
+                )
+
+            if api_key.strip():
+                _set_api_key(api_key)
+
+            # ── DVNC pipeline ─────────────────────────────────────────────
+            try:
+                router.steps  = int(steps)
+                router.fanout = int(fanout)
+                route_result     = router.route(brief)
+                route_panel_text = _format_route_panel(route_result)
+                result           = orchestrator.run(brief=brief, route_result=route_result)
+                log_text         = _format_agent_log(result["agent_log"])
+                dvnc_card        = result["final_card"]
+                pipeline_score   = round(result["overall_score"] * 100)
+                sources          = len(route_result.evidence_nodes)
+                status = (
+                    f"Complete | Score: {pipeline_score}/100 | "
+                    f"Agents: 6 | Evidence sources: {sources} "
+                    f"| Head-to-Head tab updated"
+                )
+            except Exception as e:
+                route_panel_text = f"Error: {e}"
+                log_text         = ""
+                dvnc_card        = f"[DVNC error: {e}]"
+                pipeline_score   = 0
+                status           = f"Error: {e}"
+
+            # ── Plain LLM — runs in same call ─────────────────────────────
+            try:
+                plain_card = _call_plain_llm(brief)
+            except Exception as e:
+                plain_card = f"[Plain LLM error: {e}]"
+
+            # ── Score both ────────────────────────────────────────────────
+            dvnc_scores  = _score_output(dvnc_card)
+            plain_scores = _score_output(plain_card)
+            dvnc_scores["overall"] = max(dvnc_scores["overall"], pipeline_score)
+
+            score_table = _build_score_table(dvnc_scores, plain_scores)
+
+            return (
+                # Discovery Engine tab outputs
+                route_panel_text,
+                dvnc_card,
+                log_text,
+                pipeline_score,
+                status,
+                # Head-to-Head tab outputs (auto-populated)
+                brief,
+                score_table,
+                dvnc_card,
+                dvnc_scores["overall"],
+                plain_card,
+                plain_scores["overall"],
+            )
+
+        run_btn.click(
+            fn=run_discovery,
+            inputs=[brief_input, api_key_input, steps_slider, fanout_slider],
+            outputs=[
+                # Discovery Engine
+                route_panel,
+                final_card,
+                agent_log_out,
+                overall_score_out,
+                status_out,
+                # Head-to-Head (written directly)
+                h2h_brief_display,
+                h2h_scores,
+                dvnc_out,
+                dvnc_score_display,
+                plain_out,
+                plain_score_display,
+            ],
+        )
 
     return app
