@@ -183,14 +183,7 @@ def _svg_nodes(node_list: list[tuple], positions: dict, max_w: float) -> str:
             f' font-size="{fs}" font-weight="500" fill="{lcolor}"'
             f' style="user-select:none">{_trunc(lbl, 14)}</text>'
         )
-        # Relation badge — only for nodes large enough to warrant it (r >= 8)
-        if r >= 8:
-            parts.append(
-                f'  <text x="{lx:.1f}" y="{ly + 14:.1f}" text-anchor="{anchor}"'
-                f' font-family="\'JetBrains Mono\', monospace"'
-                f' font-size="8.5" fill="#9C8E7E" letter-spacing="0.06em"'
-                f' style="user-select:none">{rel} · {w:.2f}</text>'
-            )
+
 
     return "\n".join(parts)
 
