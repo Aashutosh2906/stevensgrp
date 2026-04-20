@@ -225,7 +225,7 @@ def build_node_graph_html(concept: str, neighbors: list[dict]) -> str:
         if lbl not in seen or w > seen[lbl]["weight"]:
             seen[lbl] = {"weight": w, "rel": rel}
 
-    node_list = sorted(seen.items(), key=lambda x: x[1]["weight"], reverse=True)[:12]
+    node_list = sorted(seen.items(), key=lambda x: x[1]["weight"], reverse=True)
     n_nodes   = len(node_list)
 
     if n_nodes == 0:
